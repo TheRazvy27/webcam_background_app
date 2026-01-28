@@ -1,62 +1,188 @@
-from typing import Optional, Tuple
+import math
+import time
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
 
 
-def _ensure_3ch_mask(mask: np.ndarray) -> np.ndarray:
-    if mask.ndim == 2:
-        return np.repeat(mask[:, :, None], 3, axis=2)
-    return mask
+@dataclass
+class EffectState:
+    """!Runtime state for background replacement and visual effects."""
+
+    bg_image: np.ndarray | None = None
+    bg_video: str | None = None
+    bg_freeze: np.ndarray | None = None
+    show_mask: bool = False
+    show_edges: bool = False
+    t0: float = time.time()
+
+    def __post_init__(self):
+        """!Initialize background video capture if provided."""
+        self._bg_cap = None
+        self._bg_cached = None
+        self._grid = None
+        self._last_shape = None
+        if self.bg_video:
+            self._bg_cap = cv2.VideoCapture(self.bg_video)
+
+    def close(self):
+        """!Release background video resources."""
+        if self._bg_cap is not None:
+            self._bg_cap.release()
+
+    def now(self):
+        """!Return elapsed seconds since start."""
+        return time.time() - self.t0
+
+    def set_freeze(self, frame):
+        """!Freeze the current frame as a static background."""
+        self.bg_freeze = frame.copy()
+
+    def _resize_bg(self, bg, shape):
+        """!Resize background to match target shape."""
+        h, w = shape[:2]
+        return cv2.resize(bg, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    def _dynamic_gradient(self, shape, t):
+        """!Generate a time-animated gradient background."""
+        h, w = shape[:2]
+        if self._grid is None or self._last_shape != (h, w):
+            xs = np.linspace(0, 1, w, dtype=np.float32)
+            ys = np.linspace(0, 1, h, dtype=np.float32)
+            grid_x, grid_y = np.meshgrid(xs, ys)
+            self._grid = (grid_x, grid_y)
+            self._last_shape = (h, w)
+        grid_x, grid_y = self._grid
+        r = 0.5 + 0.5 * np.sin(2 * math.pi * (grid_x * 0.7 + t * 0.08))
+        g = 0.5 + 0.5 * np.sin(2 * math.pi * (grid_y * 0.6 + t * 0.11))
+        b = 0.5 + 0.5 * np.sin(2 * math.pi * ((grid_x + grid_y) * 0.35 + t * 0.05))
+        bg = np.dstack((b, g, r)) * 255.0
+        return bg.astype(np.uint8)
+
+    def get_background(self, shape):
+        """!Return current background frame for a given output shape."""
+        if self.bg_freeze is not None:
+            return self._resize_bg(self.bg_freeze, shape)
+        if self.bg_image is not None:
+            if self._bg_cached is None or self._bg_cached.shape[:2] != shape[:2]:
+                self._bg_cached = self._resize_bg(self.bg_image, shape)
+            return self._bg_cached.copy()
+        if self._bg_cap is not None:
+            ok, frame = self._bg_cap.read()
+            if not ok:
+                self._bg_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok, frame = self._bg_cap.read()
+            if ok:
+                return self._resize_bg(frame, shape)
+        return self._dynamic_gradient(shape, self.now())
 
 
-def _composite(frame: np.ndarray, bg_processed: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    mask_3ch = _ensure_3ch_mask(mask).astype(np.float32)
-    frame_f = frame.astype(np.float32)
-    bg_f = bg_processed.astype(np.float32)
-    out = frame_f * mask_3ch + bg_f * (1.0 - mask_3ch)
+def _blend(fg, bg, alpha):
+    """!Alpha blend between foreground and background.
+
+    @param fg Foreground BGR image.
+    @param bg Background BGR image.
+    @param alpha Alpha mask in [0,1] (H x W or H x W x 1).
+    @return Blended BGR image.
+    """
+    alpha = np.clip(alpha, 0.0, 1.0)
+    if alpha.ndim == 2:
+        alpha = alpha[:, :, None]
+    fg_f = fg.astype(np.float32)
+    bg_f = bg.astype(np.float32)
+    out = fg_f * alpha + bg_f * (1.0 - alpha)
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def apply_blur_background(
-    frame: np.ndarray, mask: np.ndarray, ksize: int, sigma: float
-) -> np.ndarray:
-    ksize = max(3, ksize)
-    if ksize % 2 == 0:
-        ksize += 1
-    blurred = cv2.GaussianBlur(frame, (ksize, ksize), sigma)
-    return _composite(frame, blurred, mask)
+def effect_bokeh(frame, mask_soft, _mask_bin, state):
+    """!Blur background while keeping person sharp."""
+    bg = cv2.GaussianBlur(frame, (0, 0), sigmaX=18, sigmaY=18)
+    return _blend(frame, bg, mask_soft)
 
 
-def apply_hsv_shift_background(
-    frame: np.ndarray, mask: np.ndarray, dh: int, sat_scale: float
-) -> np.ndarray:
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
-    h, s, v = cv2.split(hsv)
-    h = (h + dh) % 180.0
-    s = np.clip(s * sat_scale, 0, 255)
-    hsv_shifted = cv2.merge([h, s, v]).astype(np.uint8)
-    shifted_bgr = cv2.cvtColor(hsv_shifted, cv2.COLOR_HSV2BGR)
-    return _composite(frame, shifted_bgr, mask)
+def effect_replace(frame, mask_soft, _mask_bin, state):
+    """!Replace background with image/video/gradient."""
+    bg = state.get_background(frame.shape)
+    return _blend(frame, bg, mask_soft)
 
 
-def apply_replace_background(
-    frame: np.ndarray, mask: np.ndarray, bg_image: Optional[np.ndarray]
-) -> np.ndarray:
-    if bg_image is None:
-        return frame.copy()
-    return _composite(frame, bg_image, mask)
+def effect_color_pop(frame, mask_soft, _mask_bin, state):
+    """!Keep person in color, desaturate background."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    bg = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    return _blend(frame, bg, mask_soft)
 
 
-def apply_person_highlight(
-    frame: np.ndarray, mask: np.ndarray, alpha: float, beta: float, edge_strength: float
-) -> np.ndarray:
-    enhanced = cv2.convertScaleAbs(frame, alpha=alpha, beta=beta)
-    out = _composite(enhanced, frame, mask)
+def effect_pixelate(frame, mask_soft, _mask_bin, state):
+    """!Pixelate background for a stylized look."""
+    h, w = frame.shape[:2]
+    scale = 0.08
+    small = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
+    bg = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+    return _blend(frame, bg, mask_soft)
 
-    if edge_strength > 0:
-        mask_u8 = (mask * 255).astype(np.uint8)
-        edges = cv2.Canny(mask_u8, 50, 150)
-        edges_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-        out = cv2.addWeighted(out, 1.0, edges_bgr, edge_strength, 0)
-    return out
+
+def _edge_glow(mask_bin, color=(0, 255, 255)):
+    """!Create a glow outline around the person mask."""
+    edges = cv2.Canny(mask_bin * 255, 30, 120)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    glow = cv2.dilate(edges, kernel, iterations=1)
+    glow = cv2.GaussianBlur(glow, (0, 0), sigmaX=3)
+    glow = glow.astype(np.float32) / 255.0
+    glow = glow[:, :, None] * np.array(color, dtype=np.float32)[None, None, :]
+    return glow
+
+
+def effect_neon(frame, mask_soft, mask_bin, state):
+    """!Neon-styled background with glowing contour."""
+    bg = state.get_background(frame.shape)
+    tinted = cv2.addWeighted(bg, 0.65, frame, 0.35, 0)
+    out = _blend(frame, tinted, mask_soft)
+    glow = _edge_glow(mask_bin, color=(0, 255, 200))
+    out_f = out.astype(np.float32)
+    out_f = np.clip(out_f + glow * 0.9, 0, 255)
+    return out_f.astype(np.uint8)
+
+
+def effect_shadow(frame, mask_soft, mask_bin, state):
+    """!Drop-shadow effect behind the person."""
+    bg = state.get_background(frame.shape)
+    base = _blend(frame, bg, mask_soft)
+    shadow = cv2.dilate(mask_bin * 255, None, iterations=8)
+    shadow = cv2.GaussianBlur(shadow, (0, 0), sigmaX=9)
+    shadow = (shadow.astype(np.float32) / 255.0) * 0.5
+    shadow = shadow[:, :, None]
+    shift = 12
+    shadow_img = np.zeros_like(base, dtype=np.float32)
+    shadow_img[shift:, shift:, :] = base[:-shift, :-shift, :]
+    out = base.astype(np.float32) * (1.0 - shadow) + shadow_img * shadow
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def effect_glass(frame, mask_soft, _mask_bin, state):
+    """!Refraction-like glass background."""
+    bg = state.get_background(frame.shape)
+    # Subtle refraction-like warp for background
+    h, w = frame.shape[:2]
+    xs = np.linspace(0, 2 * math.pi, w, dtype=np.float32)
+    ys = np.linspace(0, 2 * math.pi, h, dtype=np.float32)
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    dx = (np.sin(grid_y * 2.0 + state.now() * 1.3) * 4).astype(np.float32)
+    dy = (np.cos(grid_x * 2.0 + state.now() * 1.1) * 4).astype(np.float32)
+    map_x, map_y = np.meshgrid(np.arange(w), np.arange(h))
+    map_x = (map_x + dx).astype(np.float32)
+    map_y = (map_y + dy).astype(np.float32)
+    warped = cv2.remap(bg, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    return _blend(frame, warped, mask_soft)
+
+
+EFFECTS = {
+    "bokeh": effect_bokeh,
+    "replace": effect_replace,
+    "color_pop": effect_color_pop,
+    "pixelate": effect_pixelate,
+    "neon": effect_neon,
+    "shadow": effect_shadow,
+    "glass": effect_glass,
+}
