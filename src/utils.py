@@ -1,84 +1,44 @@
-import json
-import os
 import time
-from datetime import datetime
-from typing import Any, Dict, Tuple
 
 import cv2
-import numpy as np
-
-
-def load_config(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def safe_odd(value: int, min_value: int = 1) -> int:
-    if value < min_value:
-        value = min_value
-    if value % 2 == 0:
-        value += 1
-    return value
-
-
-def safe_resize(image: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
-    width, height = size
-    return cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR)
-
-
-def overlay_text(
-    frame: np.ndarray,
-    text: str,
-    org: Tuple[int, int],
-    font_scale: float = 0.5,
-    thickness: int = 1,
-    color: Tuple[int, int, int] = (0, 255, 0),
-) -> None:
-    cv2.putText(
-        frame,
-        text,
-        org,
-        cv2.FONT_HERSHEY_SIMPLEX,
-        font_scale,
-        color,
-        thickness,
-        cv2.LINE_AA,
-    )
-
-
-def save_snapshot(frame: np.ndarray, directory: str) -> str:
-    ensure_dir(directory)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"snapshot_{timestamp}.jpg"
-    path = os.path.join(directory, filename)
-    cv2.imwrite(path, frame)
-    return path
 
 
 class FPSCounter:
-    def __init__(self, window_size: int = 30) -> None:
-        self.window_size = max(1, window_size)
+    def __init__(self, window=30):
+        self.window = window
         self._times = []
-        self._last_time = time.time()
 
-    def update(self) -> float:
+    def tick(self):
         now = time.time()
-        dt = now - self._last_time
-        self._last_time = now
-        self._times.append(dt)
-        if len(self._times) > self.window_size:
+        self._times.append(now)
+        if len(self._times) > self.window:
             self._times.pop(0)
-        return self.fps
+        if len(self._times) < 2:
+            return 0.0
+        return (len(self._times) - 1) / (self._times[-1] - self._times[0])
 
-    @property
-    def fps(self) -> float:
-        if not self._times:
-            return 0.0
-        total = sum(self._times)
-        if total <= 0:
-            return 0.0
-        return len(self._times) / total
+
+def draw_hud(frame, fps, effect_name, state, help_text=True):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.5
+    color = (235, 235, 235)
+    shadow = (20, 20, 20)
+
+    def put(text, x, y):
+        cv2.putText(frame, text, (x + 1, y + 1), font, scale, shadow, 2, cv2.LINE_AA)
+        cv2.putText(frame, text, (x, y), font, scale, color, 1, cv2.LINE_AA)
+
+    put(f"FPS: {fps:.1f}", 12, 22)
+    put(f"Effect: {effect_name}", 12, 44)
+
+    if help_text:
+        put(
+            "Keys: 1-7 effects | m mask | f freeze bg | r record | s snapshot | d dump | q quit | use Controls window",
+            12,
+            frame.shape[0] - 12,
+        )
+
+    if state.show_mask:
+        put("Mask preview: ON", frame.shape[1] - 170, 22)
+
+    return frame
